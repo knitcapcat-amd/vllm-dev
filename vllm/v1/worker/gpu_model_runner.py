@@ -4904,6 +4904,40 @@ class GPUModelRunner(
 
         get_offloader().post_init()
 
+        self._maybe_apply_encoder_cp_hooks()
+
+    def _maybe_apply_encoder_cp_hooks(self) -> None:
+        """Apply encoder context parallelism hooks if configured."""
+        from vllm.model_executor.models.vision import (
+            get_encoder_cp_group,
+            is_encoder_cp_enabled,
+        )
+
+        if not is_encoder_cp_enabled():
+            return
+
+        cp_group = get_encoder_cp_group()
+        if cp_group is None:
+            return
+
+        from vllm.model_executor.layers.attention.encoder_cp_hooks import (
+            find_and_apply_encoder_cp_hooks,
+        )
+
+        # Unwrap CUDA graph / ubatch wrappers to get the actual model
+        model = self.model
+        while hasattr(model, "model") and not hasattr(model, "embed_multimodal"):
+            model = model.model
+
+        num_applied = find_and_apply_encoder_cp_hooks(model, cp_group)
+        if num_applied > 0:
+            logger.info("Encoder CP: applied hooks to %d encoder module(s)",
+                        num_applied)
+        else:
+            logger.warning(
+                "Encoder CP is enabled (mm_encoder_cp_size > 1) but no "
+                "encoder modules with MMEncoderAttention were found.")
+
     def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
         """Extract Eagle3 auxiliary layer indices from speculative config.
 

@@ -388,6 +388,30 @@ class MMEncoderAttention(CustomOp):
     ) -> torch.Tensor:
         return self._forward_sdpa(query, key, value, cu_seqlens)
 
+    def _forward_ring_cp(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        cp_group: "torch.distributed.ProcessGroup",
+    ) -> torch.Tensor:
+        """Ring Attention for encoder context parallelism.
+
+        Input shape: (batch_size, seq_len, num_heads, head_size) — already 4D.
+        The sequence dimension is the local chunk for this CP rank.
+        """
+        from vllm.v1.attention.ops.ring_attn import ring_flash_attn_func
+
+        output = ring_flash_attn_func(
+            query,
+            key,
+            value,
+            cp_group=cp_group,
+            softmax_scale=self.scale,
+            causal=False,
+        )
+        return output
+
     def forward_cuda(
         self,
         query: torch.Tensor,
@@ -398,6 +422,22 @@ class MMEncoderAttention(CustomOp):
         sequence_lengths: torch.Tensor
         | None = None,  # Only used for FlashInfer CuDNN backend
     ) -> torch.Tensor:
+        from vllm.model_executor.layers.attention.encoder_cp_hooks import (
+            get_active_encoder_cp_group,
+        )
+
+        cp_group = get_active_encoder_cp_group()
+        if cp_group is not None:
+            bsz, q_len = query.size()[:2]
+            kv_len = key.size(1)
+            is_reshaped = query.dim() != 4
+            query, key, value = self.view_qkv_to_4d(
+                query, key, value, bsz, q_len, kv_len)
+            output = self._forward_ring_cp(query, key, value, cp_group)
+            if is_reshaped:
+                output = output.reshape(bsz, q_len, -1)
+            return output
+
         if self.is_flash_attn_backend:
             return self._forward_fa(query, key, value, cu_seqlens, max_seqlen)
         elif self.attn_backend == AttentionBackendEnum.TRITON_ATTN:

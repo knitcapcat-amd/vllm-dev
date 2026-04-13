@@ -143,6 +143,51 @@ def is_vit_use_data_parallel():
     return mm_encoder_tp_mode == "data"
 
 
+def _get_multimodal_config() -> MultiModalConfig | None:
+    try:
+        vllm_config: VllmConfig = get_current_vllm_config()
+        model_config = vllm_config.model_config
+        return (
+            model_config.multimodal_config if model_config is not None else None
+        )
+    except (AssertionError, AttributeError):
+        return None
+
+
+def get_encoder_cp_size() -> int:
+    """Return the context parallelism size for multimodal encoders."""
+    mm_config = _get_multimodal_config()
+    if mm_config is None:
+        return 1
+    return mm_config.mm_encoder_cp_size
+
+
+def is_encoder_cp_enabled() -> bool:
+    """Return True if encoder context parallelism is active."""
+    return get_encoder_cp_size() > 1
+
+
+def get_encoder_cp_group() -> "torch.distributed.ProcessGroup | None":
+    """Return the process group for encoder context parallelism.
+
+    When encoder CP is active (``mm_encoder_cp_size > 1``), the TP ranks
+    cooperate on the sequence dimension instead of being used for data-
+    parallel batching.  The CP group is the TP group's underlying
+    ``ProcessGroup``.
+    """
+    if not is_encoder_cp_enabled():
+        return None
+    from vllm.distributed import get_tp_group
+    return get_tp_group().device_group
+
+
+def get_encoder_cp_rank() -> int:
+    """Return this rank's index within the encoder CP group."""
+    if not is_encoder_cp_enabled():
+        return 0
+    return get_tensor_model_parallel_rank()
+
+
 VisionFeatureSelectStrategyStr = Literal["class", "default", "full"]
 
 VisionFeatureSelectStrategy: TypeAlias = (

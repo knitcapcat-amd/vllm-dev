@@ -158,6 +158,13 @@ class MultiModalConfig:
     """Optional override for the multi-modal encoder attention backend when
     using vision transformers. Accepts any value from
     `vllm.v1.attention.backends.registry.AttentionBackendEnum` (e.g. `FLASH_ATTN`)."""
+    mm_encoder_cp_size: int = Field(default=1, ge=1)
+    """Context parallelism size for multimodal encoders.  When > 1, the
+    encoder input sequence is sharded across this many ranks and Ring
+    Attention is used to compute attention.  This is orthogonal to TP.
+
+    Requires ``mm_encoder_tp_mode="data"`` so that each rank holds
+    the full encoder weights."""
     interleave_mm_strings: bool = False
     """Enable fully interleaved support for multimodal prompts, while using
     --chat-template-content-format=string."""
@@ -233,6 +240,12 @@ class MultiModalConfig:
                 "'mm_shm_cache_max_object_size_mb' should only be set when "
                 "'mm_processor_cache_type' is 'shm'."
             )
+        if self.mm_encoder_cp_size > 1 and self.mm_encoder_tp_mode != "data":
+            raise ValueError(
+                "Encoder context parallelism (mm_encoder_cp_size > 1) "
+                "requires mm_encoder_tp_mode='data' so each rank holds "
+                "the full encoder weights."
+            )
         return self
 
     def compute_hash(self) -> str:
@@ -252,6 +265,7 @@ class MultiModalConfig:
             if self.mm_encoder_attn_backend is not None
             else None,
             self.mm_encoder_tp_mode,
+            self.mm_encoder_cp_size,
         ]
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
         return hash_str
