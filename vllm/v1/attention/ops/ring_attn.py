@@ -5,8 +5,12 @@ Ring Attention for Context Parallelism.
 
 Implements Ring Attention where Q stays local while K/V circulate through
 a ring of CP ranks.  Each step computes a partial attention block and
-incrementally merges the result using numerically-stable online softmax
-(log-sum-exp correction).
+incrementally merges the result using online softmax correction.
+
+The online merge approach (from vllm-omni / long-context-attention) updates
+the running output in-place at each step using sigmoid/logsigmoid, which
+is faster and more memory-efficient than the two-phase collect-then-rescale
+approach.
 
 Two interfaces are provided:
 
@@ -17,8 +21,8 @@ Two interfaces are provided:
   AR prefill context parallelism.
 
 References:
-    - TransformerEngine context_parallel.py (NVIDIA, 2024-2026)
     - vllm-omni diffusion/attention/backends/ring_flash_attn.py
+    - Fang et al., long-context-attention (yunchang)
     - Liu et al., "Ring Attention with Blockwise Transformers" (2023)
 """
 
@@ -26,110 +30,65 @@ from __future__ import annotations
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 
 from vllm.distributed.ring_comm import RingComm
 
 
 # ---------------------------------------------------------------------------
-# Online softmax merge (numerically stable)
-# ---------------------------------------------------------------------------
-# TE uses:  max_scale + log1p(exp(min_scale - max_scale))
-# vllm-omni uses:  out - sigmoid(block_lse - lse) * (out - block_out)
-#
-# We follow TE's two-phase approach (merge LSE first, then correct output)
-# because it decouples the LSE accumulation from the output correction and
-# is easier to reason about numerically.  The final output correction is
-# done once after all ring steps.
+# Online softmax merge
 # ---------------------------------------------------------------------------
 
 
-def _merge_lse(
-    lse: torch.Tensor,
-    lse_new: torch.Tensor,
-) -> torch.Tensor:
-    """Merge two log-sum-exp values: log(exp(a) + exp(b)).
-
-    Uses the numerically stable formula:
-        max(a, b) + log1p(exp(min(a, b) - max(a, b)))
-
-    Args:
-        lse: Running accumulated LSE.
-        lse_new: LSE from the current ring step.
-
-    Returns:
-        Merged LSE (same shape, float32).
-    """
-    max_scale = torch.maximum(lse, lse_new)
-    min_scale = torch.minimum(lse, lse_new)
-    return max_scale + torch.log1p(torch.exp(min_scale - max_scale))
-
-
-def _rescale_out(
+def _update_out_and_lse(
     out: torch.Tensor,
-    lse_cur: torch.Tensor,
-    lse_merged: torch.Tensor,
-    seq_dim: int,
-) -> torch.Tensor:
-    """Rescale an output block by exp(lse_cur - lse_merged).
-
-    ``lse_*`` tensors have shape ``[B, H, S]`` while ``out`` has shape
-    ``[B, S, H, D]``.  We move the H dim to align for broadcasting.
-
-    Args:
-        out: Output tensor ``[B, S, H, D]``.
-        lse_cur: LSE that was used to produce *out*, ``[B, H, S]``.
-        lse_merged: Global merged LSE, ``[B, H, S]``.
-        seq_dim: Sequence dimension in *out* (typically 1).
-
-    Returns:
-        Rescaled output (float32).
-    """
-    # [B, H, S] → [B, S, H] → [B, S, H, 1]
-    scale = torch.exp(lse_cur - lse_merged)
-    scale = scale.movedim(-1, seq_dim).unsqueeze(-1)
-    return out * scale
-
-
-def _correct_outputs(
-    out_per_step: list[torch.Tensor],
-    lse_per_step: list[torch.Tensor],
-    seq_dim: int = 1,
+    lse: torch.Tensor,
+    block_out: torch.Tensor,
+    block_lse: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Correct and merge partial outputs from all ring steps.
+    """Incrementally merge a new attention block into the running output.
 
-    Phase 1 — accumulate global LSE:
-        global_lse = log(sum_i exp(lse_i))
+    Uses the online softmax correction formula:
 
-    Phase 2 — rescale each step's output and sum:
-        out = sum_i  out_i * exp(lse_i - global_lse)
+        out = out - sigmoid(block_lse - lse) * (out - block_out)
+        lse = lse - logsigmoid(lse - block_lse)
 
-    This follows TransformerEngine's approach.
+    All computation is done in float32 for numerical stability.
 
     Args:
-        out_per_step: List of partial output tensors ``[B, S, H, D]``.
-        lse_per_step: List of LSE tensors ``[B, H, S]`` (float32).
-        seq_dim: Sequence dimension in the output tensors.
+        out: Running merged output ``[B, S, H, D]`` (float32).
+        lse: Running log-sum-exp ``[B, S, H, 1]`` (float32).
+        block_out: New block output ``[B, S, H, D]``.
+        block_lse: New block LSE ``[B, H, S]`` (float32 from FA).
 
     Returns:
-        (merged_out, global_lse) where merged_out is in the original
-        dtype and global_lse is ``[B, H, S]`` in float32.
+        Updated (out, lse), both float32.
     """
-    assert len(out_per_step) == len(lse_per_step) > 0
+    block_out = block_out.to(torch.float32)
+    # block_lse from FA is [B, H, S] → convert to [B, S, H, 1]
+    block_lse = block_lse.transpose(1, 2).unsqueeze(-1)
 
-    # Phase 1: accumulate global LSE
-    global_lse = lse_per_step[0].clone()
-    for lse_i in lse_per_step[1:]:
-        global_lse = _merge_lse(global_lse, lse_i)
+    out = out - F.sigmoid(block_lse - lse) * (out - block_out)
+    lse = lse - F.logsigmoid(lse - block_lse)
+    return out, lse
 
-    # Phase 2: rescale and accumulate outputs
-    out_dtype = out_per_step[0].dtype
-    merged_out = _rescale_out(
-        out_per_step[0].float(), lse_per_step[0], global_lse, seq_dim)
-    for out_i, lse_i in zip(out_per_step[1:], lse_per_step[1:]):
-        merged_out = merged_out + _rescale_out(
-            out_i.float(), lse_i, global_lse, seq_dim)
 
-    return merged_out.to(out_dtype), global_lse
+def _init_out_and_lse(
+    block_out: torch.Tensor,
+    block_lse: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Initialize the running output and LSE from the first block.
+
+    Args:
+        block_out: First block output ``[B, S, H, D]``.
+        block_lse: First block LSE ``[B, H, S]`` (float32 from FA).
+
+    Returns:
+        (out, lse) in float32.  lse shape is ``[B, S, H, 1]``.
+    """
+    out = block_out.to(torch.float32)
+    lse = block_lse.transpose(1, 2).unsqueeze(-1)
+    return out, lse
 
 
 # ---------------------------------------------------------------------------
@@ -176,18 +135,15 @@ def ring_flash_attn_func(
     k = k.contiguous()
     v = v.contiguous()
 
-    out_per_step: list[torch.Tensor] = []
-    lse_per_step: list[torch.Tensor] = []
+    out: torch.Tensor | None = None
+    lse: torch.Tensor | None = None
 
     for step in range(comm.world_size):
-        # --- async P2P: send current KV, receive next KV ---
         if step + 1 < comm.world_size:
             next_k = comm.send_recv(k)
             next_v = comm.send_recv(v)
             comm.commit()
 
-        # --- compute attention for this step ---
-        # For causal: only attend to KV from ranks 0..self.rank
         if not causal or step <= comm.rank:
             block_out, block_lse, _ = _flash_attn_func(
                 q, k, v,
@@ -195,19 +151,20 @@ def ring_flash_attn_func(
                 causal=causal and step == 0,
                 return_attn_probs=True,
             )
-            # block_out: [B, S, H, D],  block_lse: [B, H, S] (float32)
-            out_per_step.append(block_out)
-            lse_per_step.append(block_lse)
 
-        # --- wait for P2P, rotate KV ---
+            if out is None:
+                out, lse = _init_out_and_lse(block_out, block_lse)
+            else:
+                out, lse = _update_out_and_lse(
+                    out, lse, block_out, block_lse)
+
         if step + 1 < comm.world_size:
             comm.wait()
             k = next_k
             v = next_v
 
-    # --- merge all partial outputs ---
-    output, _ = _correct_outputs(out_per_step, lse_per_step, seq_dim=1)
-    return output
+    assert out is not None
+    return out.to(q.dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -259,8 +216,8 @@ def ring_flash_attn_varlen_func(
     k = k.contiguous()
     v = v.contiguous()
 
-    out_per_step: list[torch.Tensor] = []
-    lse_per_step: list[torch.Tensor] = []
+    out: torch.Tensor | None = None
+    lse: torch.Tensor | None = None
 
     for step in range(comm.world_size):
         if step + 1 < comm.world_size:
@@ -279,18 +236,21 @@ def ring_flash_attn_varlen_func(
                 causal=causal and step == 0,
                 return_attn_probs=True,
             )
-            out_per_step.append(block_out)
-            lse_per_step.append(block_lse)
+
+            # varlen FA: block_out [N, H, D], block_lse [H, N]
+            # Add batch dim for _init/_update which expect [B, S, H, D]
+            bo = block_out.unsqueeze(0)
+            bl = block_lse.unsqueeze(0)  # [1, H, N]
+
+            if out is None:
+                out, lse = _init_out_and_lse(bo, bl)
+            else:
+                out, lse = _update_out_and_lse(out, lse, bo, bl)
 
         if step + 1 < comm.world_size:
             comm.wait()
             k = next_k
             v = next_v
 
-    # varlen: out is [total_tokens, H, D], lse is [H, total_tokens]
-    # Adapt _correct_outputs for 3D by adding a batch dim, then squeeze
-    out_stacked = [o.unsqueeze(0) for o in out_per_step]
-    # lse from varlen FA is [H, total_tokens]; make it [1, H, total_tokens]
-    lse_stacked = [l.unsqueeze(0) for l in lse_per_step]
-    output, _ = _correct_outputs(out_stacked, lse_stacked, seq_dim=1)
-    return output.squeeze(0)
+    assert out is not None
+    return out.squeeze(0).to(q.dtype)
