@@ -325,6 +325,7 @@ class ModelConfig:
     mm_encoder_only: InitVar[bool | None] = None
     mm_encoder_tp_mode: InitVar[MMEncoderTPMode | None] = None
     mm_encoder_attn_backend: InitVar[AttentionBackendEnum | str | None] = None
+    mm_encoder_cp_size: InitVar[int | None] = None
     interleave_mm_strings: InitVar[bool | None] = None
     skip_mm_profiling: InitVar[bool | None] = None
     video_pruning_rate: InitVar[float | None] = None
@@ -446,6 +447,7 @@ class ModelConfig:
         mm_encoder_only: bool | None,
         mm_encoder_tp_mode: MMEncoderTPMode | None,
         mm_encoder_attn_backend: AttentionBackendEnum | str | None,
+        mm_encoder_cp_size: int | None,
         interleave_mm_strings: bool | None,
         skip_mm_profiling: bool | None,
         video_pruning_rate: float | None,
@@ -618,7 +620,20 @@ class ModelConfig:
 
         # Init multimodal config if needed
         if self._model_info.supports_multimodal:
+            # Encoder CP requires data mode (full weights per rank).
+            # Force it regardless of model's supports_encoder_tp_data flag.
             if (
+                mm_encoder_cp_size is not None
+                and mm_encoder_cp_size > 1
+            ):
+                if mm_encoder_tp_mode != "data":
+                    logger.info(
+                        "Encoder CP (mm_encoder_cp_size=%d) requires "
+                        "mm_encoder_tp_mode='data'. Setting it automatically.",
+                        mm_encoder_cp_size,
+                    )
+                mm_encoder_tp_mode = "data"
+            elif (
                 mm_encoder_tp_mode == "data"
                 and not self._model_info.supports_multimodal_encoder_tp_data
             ):
@@ -640,6 +655,7 @@ class ModelConfig:
                 mm_encoder_only=mm_encoder_only,
                 mm_encoder_tp_mode=mm_encoder_tp_mode,
                 mm_encoder_attn_backend=mm_encoder_attn_backend,
+                mm_encoder_cp_size=mm_encoder_cp_size,
                 interleave_mm_strings=interleave_mm_strings,
                 skip_mm_profiling=skip_mm_profiling,
                 video_pruning_rate=video_pruning_rate,

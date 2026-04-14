@@ -4936,7 +4936,23 @@ class GPUModelRunner(
         else:
             logger.warning(
                 "Encoder CP is enabled (mm_encoder_cp_size > 1) but no "
-                "encoder modules with MMEncoderAttention were found.")
+                "compatible encoder modules were found. "
+                "Encoder CP will be disabled for this model. "
+                "Supported architectures: CLIP, SigLIP, InternViT "
+                "(encoders using MMEncoderAttention with a standard "
+                "ModuleList layer loop).")
+            # Disable CP at runtime so MMEncoderAttention uses normal path
+            from vllm.config import get_current_vllm_config
+            try:
+                mm_config = (
+                    get_current_vllm_config()
+                    .model_config.multimodal_config
+                )
+                if mm_config is not None:
+                    object.__setattr__(mm_config,
+                                       "mm_encoder_cp_size", 1)
+            except Exception:
+                pass
 
     def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
         """Extract Eagle3 auxiliary layer indices from speculative config.

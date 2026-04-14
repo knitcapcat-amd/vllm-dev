@@ -126,7 +126,17 @@ def get_vit_attn_backend(
 
 def is_vit_use_data_parallel():
     """
-    Get the tensor parallel type for Vision Transformer.
+    Check if the vision encoder should use data-parallel mode.
+
+    Returns True when ``mm_encoder_tp_mode="data"``.  This controls
+    **both** weight loading (``disable_tp=True``) and image-level DP
+    dispatch (``run_dp_sharded_*``).
+
+    When encoder CP is also enabled (``mm_encoder_cp_size > 1``), this
+    still returns True so that each rank loads full encoder weights.
+    The DP dispatch functions (``run_dp_sharded_*``) should additionally
+    check :func:`is_encoder_cp_enabled` to decide whether to split
+    images across ranks or let all ranks process the same images.
     """
     try:
         vllm_config: VllmConfig = get_current_vllm_config()
@@ -332,6 +342,10 @@ def run_dp_sharded_vision_model(
     Returns:
         torch.Tensor: Output image embeddings
     """
+    # When encoder CP is active, all ranks process the same images
+    # (sequence parallelism via Ring Attention hooks instead of image DP).
+    if is_encoder_cp_enabled():
+        return vision_model(image_input)
 
     num_chunks = image_input.shape[0]
     mp_world_size = get_tensor_model_parallel_world_size()
@@ -454,6 +468,16 @@ def run_dp_sharded_mrope_vision_model(
         ```
 
     """
+    # When encoder CP is active, all ranks process the same images.
+    if is_encoder_cp_enabled():
+        image_embeds = vision_model(pixel_values, grid_thw=grid_thw_list)
+        merge_size = vision_model.spatial_merge_size
+        sizes = [
+            math.prod(grid_thw) // (merge_size**2)
+            for grid_thw in grid_thw_list
+        ]
+        return image_embeds.split(sizes)
+
     tp_size = get_tensor_model_parallel_world_size()
 
     # GPU_0 tp_rank_local = 0
